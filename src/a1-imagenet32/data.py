@@ -25,6 +25,7 @@ This is the same trick as the GPU-resident hyperparameter sweep in CSED 503 A1, 
 It only works because the images are tiny; you could not do this with 224x224 ImageNet (which would
 be ~190 GB).  32x32 is what makes it possible.
 """
+
 from __future__ import annotations
 
 import json
@@ -34,13 +35,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+import subsets as S
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
 def load_stats() -> dict:
-    p = os.path.join(DATA_DIR, 'stats.json')
+    p = os.path.join(DATA_DIR, "stats.json")
     if not os.path.exists(p):
-        raise FileNotFoundError(f'{p} not found -- run prepare_data.py first.')
+        raise FileNotFoundError(f"{p} not found -- run prepare_data.py first.")
     return json.load(open(p))
 
 
@@ -50,40 +53,135 @@ class GpuImageNet32:
     Replaces torchvision transforms + Dataset + DataLoader with ~30 lines of tensor code.
     """
 
-    def __init__(self, device: torch.device, split: str = 'train', subset: int | None = None,
-                 seed: int = 0):
+    def __init__(
+        self,
+        device: torch.device,
+        split: str = "train",
+        subset: int | None = None,
+        seed: int = 0,
+        subset_fraction: float | None = None,
+        subset_manifest_dir: str | None = None,
+    ):
+        """Load an ImageNet-32 split and optionally select a stratified subset.
+
+        Args:
+            device:
+                CUDA device that will store the selected images.
+
+            split:
+                Either ``"train"`` or ``"val"``.
+
+            subset:
+                Optional exact number of rows to retain. This is primarily used
+                by the existing smoke-test mode.
+
+            seed:
+                Seed used to select subset rows.
+
+            subset_fraction:
+                Optional fraction of the split to retain. For example, ``0.05``
+                retains approximately 5% of the training set.
+
+            subset_manifest_dir:
+                Directory where exact selected row indices will be saved and
+                reused.
+        """
         stats = load_stats()
-        x = np.load(os.path.join(DATA_DIR, f'{split}_x.npy'), mmap_mode='r')
-        y = np.load(os.path.join(DATA_DIR, f'{split}_y.npy'), mmap_mode='r')
 
-        if subset is not None and subset < len(x):
-            # CRITICAL: the file is sorted by class, so a SEQUENTIAL subset would contain only a
-            # handful of classes (the first 10,000 rows hold just 8 of the 1000!).  Sample at random
-            # across the whole file instead.  A --smoke-test that trained on 8 classes and reported
-            # 95% accuracy would be a genuinely evil bug.
-            rng = np.random.default_rng(seed)
-            idx = np.sort(rng.choice(len(x), size=subset, replace=False))
-            x, y = x[idx], y[idx]
+        x = np.load(
+            os.path.join(DATA_DIR, f"{split}_x.npy"),
+            mmap_mode="r",
+        )
 
-        # (N, 32, 32, 3) uint8 -> GPU.  Keep it as uint8: 3.9 GB, versus 15.7 GB as float32.
-        # We convert to float per-batch, which is nearly free on the GPU.
-        self.x = torch.from_numpy(np.ascontiguousarray(x)).to(device, non_blocking=True)
-        self.y = torch.from_numpy(np.ascontiguousarray(y)).to(device, non_blocking=True).long()
+        y = np.load(
+            os.path.join(DATA_DIR, f"{split}_y.npy"),
+            mmap_mode="r",
+        )
+
+        self.split = split
+        self.full_n = len(y)
+        self.subset_metadata = None
+        self.subset_manifest_path = None
+
+        if subset is not None and subset_fraction is not None:
+            raise ValueError("Provide either subset or subset_fraction, not both.")
+
+        if subset is not None and not 1 <= subset <= self.full_n:
+            raise ValueError(
+                f"subset must be between 1 and {self.full_n:,}, got {subset:,}."
+            )
+
+        if subset_fraction is not None and not 0.0 < subset_fraction <= 1.0:
+            raise ValueError("subset_fraction must be in the interval (0, 1].")
+
+        use_size_subset = subset is not None and subset < self.full_n
+
+        use_fraction_subset = subset_fraction is not None and subset_fraction < 1.0
+
+        if use_size_subset or use_fraction_subset:
+            indices, metadata, manifest_path = S.get_or_create_stratified_indices(
+                y,
+                size=subset if use_size_subset else None,
+                fraction=(subset_fraction if use_fraction_subset else None),
+                seed=seed,
+                split=split,
+                manifest_dir=subset_manifest_dir,
+                ensure_all_classes=True,
+            )
+
+            x = x[indices]
+            y = y[indices]
+
+            self.subset_metadata = metadata
+            self.subset_manifest_path = (
+                str(manifest_path) if manifest_path is not None else None
+            )
+
+        # Keep images as uint8 while resident on the GPU.
+        #
+        # Image values are converted to normalized floating point tensors only
+        # when each batch is requested.
+        self.x = torch.from_numpy(np.ascontiguousarray(x)).to(
+            device,
+            non_blocking=True,
+        )
+
+        self.y = (
+            torch.from_numpy(np.ascontiguousarray(y))
+            .to(
+                device,
+                non_blocking=True,
+            )
+            .long()
+        )
+
         self.device = device
         self.n = len(self.y)
+        self.actual_fraction = self.n / self.full_n
 
-        # Normalization constants as (1,3,1,1) so they broadcast over a batch.
-        self.mean = torch.tensor(stats['mean'], device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor(stats['std'], device=device).view(1, 3, 1, 1)
-        self.n_classes = stats['n_classes']
+        # Shape normalization constants as (1, 3, 1, 1), allowing them to
+        # broadcast across every image in a batch.
+        self.mean = torch.tensor(
+            stats["mean"],
+            device=device,
+        ).view(1, 3, 1, 1)
+
+        self.std = torch.tensor(
+            stats["std"],
+            device=device,
+        ).view(1, 3, 1, 1)
+
+        self.n_classes = stats["n_classes"]
 
     def gb(self) -> float:
         return (self.x.numel() + self.y.numel() * 8) / 1e9
 
     def _to_float(self, xb: torch.Tensor) -> torch.Tensor:
         """(B,32,32,3) uint8 -> (B,3,32,32) normalized float.  This is ToTensor + Normalize."""
-        xb = xb.permute(0, 3, 1, 2).float().div_(255.0)      # NHWC uint8 -> NCHW float in [0,1]
-        return xb.sub_(self.mean).div_(self.std)             # (x - mean) / std
+        xb = (
+            xb.permute(0, 3, 1, 2).float().div_(255.0)
+        )  # NHWC uint8 -> NCHW float in [0,1]
+        return xb.sub_(self.mean).div_(self.std)  # (x - mean) / std
 
     def _augment(self, xb: torch.Tensor) -> torch.Tensor:
         """RandomCrop(32, padding=4) + RandomHorizontalFlip, batched, on the GPU.
@@ -94,12 +192,12 @@ class GpuImageNet32:
         b, d = xb.shape[0], xb.device
 
         # --- RandomCrop(32, padding=4): pad to 40x40, then cut a random 32x32 window per image.
-        xp = F.pad(xb, (4, 4, 4, 4))                          # (B,3,40,40), zero padding
-        i = torch.randint(0, 9, (b,), device=d)               # 9 = 40 - 32 + 1 valid offsets
+        xp = F.pad(xb, (4, 4, 4, 4))  # (B,3,40,40), zero padding
+        i = torch.randint(0, 9, (b,), device=d)  # 9 = 40 - 32 + 1 valid offsets
         j = torch.randint(0, 9, (b,), device=d)
         ar = torch.arange(32, device=d)
-        rows = (i.view(b, 1, 1) + ar.view(1, 32, 1))          # (B,32,1)
-        cols = (j.view(b, 1, 1) + ar.view(1, 1, 32))          # (B,1,32)
+        rows = i.view(b, 1, 1) + ar.view(1, 32, 1)  # (B,32,1)
+        cols = j.view(b, 1, 1) + ar.view(1, 1, 32)  # (B,1,32)
         bidx = torch.arange(b, device=d).view(b, 1, 1)
         # Advanced indexing with a slice between the index tensors puts the indexed dims first,
         # so this comes back as (B,32,32,C) -- hence the permute.
@@ -110,7 +208,9 @@ class GpuImageNet32:
         xb[flip] = xb[flip].flip(-1)
         return xb
 
-    def epoch(self, batch_size: int, train: bool, generator: torch.Generator | None = None):
+    def epoch(
+        self, batch_size: int, train: bool, generator: torch.Generator | None = None
+    ):
         """Yield (images, labels) for one pass. Shuffled + augmented when train=True."""
         if train:
             order = torch.randperm(self.n, device=self.device, generator=generator)
@@ -118,7 +218,7 @@ class GpuImageNet32:
             order = torch.arange(self.n, device=self.device)
 
         for s in range(0, self.n, batch_size):
-            idx = order[s:s + batch_size]
+            idx = order[s : s + batch_size]
             xb = self._to_float(self.x[idx])
             if train:
                 xb = self._augment(xb)
@@ -143,7 +243,10 @@ class GpuImageNet32:
 # mixup + CutMix + erasing, and why a CNN recipe can get away without them.
 # ---------------------------------------------------------------------------------------------------
 
-def random_erasing_(x: torch.Tensor, p: float = 0.25, scale=(0.02, 0.2)) -> torch.Tensor:
+
+def random_erasing_(
+    x: torch.Tensor, p: float = 0.25, scale=(0.02, 0.2)
+) -> torch.Tensor:
     """Cut a random rectangle out of a random subset of the batch. GPU-side RandomErasing.
 
     FULLY VECTORIZED -- and it has to be.  The first version looped in Python over the ~25% of the
@@ -157,22 +260,31 @@ def random_erasing_(x: torch.Tensor, p: float = 0.25, scale=(0.02, 0.2)) -> torc
     d = x.device
     area = h * w * (torch.rand(b, device=d) * (scale[1] - scale[0]) + scale[0])
     ratio = torch.empty(b, device=d).uniform_(0.3, 3.3)
-    eh = (area * ratio).sqrt().clamp(1, h - 1).long()          # (B,)
+    eh = (area * ratio).sqrt().clamp(1, h - 1).long()  # (B,)
     ew = (area / ratio).sqrt().clamp(1, w - 1).long()
     top = (torch.rand(b, device=d) * (h - eh).float()).long()
     left = (torch.rand(b, device=d) * (w - ew).float()).long()
 
-    rows = torch.arange(h, device=d).view(1, h, 1)             # broadcast against (B,1,1)
+    rows = torch.arange(h, device=d).view(1, h, 1)  # broadcast against (B,1,1)
     cols = torch.arange(w, device=d).view(1, 1, w)
-    inside = ((rows >= top.view(b, 1, 1)) & (rows < (top + eh).view(b, 1, 1)) &
-              (cols >= left.view(b, 1, 1)) & (cols < (left + ew).view(b, 1, 1)))
+    inside = (
+        (rows >= top.view(b, 1, 1))
+        & (rows < (top + eh).view(b, 1, 1))
+        & (cols >= left.view(b, 1, 1))
+        & (cols < (left + ew).view(b, 1, 1))
+    )
     hit = (torch.rand(b, device=d) < p).view(b, 1, 1)
-    mask = (inside & hit).unsqueeze(1)                          # (B,1,H,W) -> broadcasts over C
-    return x.masked_fill_(mask, 0.0)                           # 0 == the channel mean, post-normalize
+    mask = (inside & hit).unsqueeze(1)  # (B,1,H,W) -> broadcasts over C
+    return x.masked_fill_(mask, 0.0)  # 0 == the channel mean, post-normalize
 
 
-def mixup_cutmix(x: torch.Tensor, y: torch.Tensor, mixup_alpha: float = 0.2,
-                 cutmix_alpha: float = 1.0, prob: float = 0.5):
+def mixup_cutmix(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mixup_alpha: float = 0.2,
+    cutmix_alpha: float = 1.0,
+    prob: float = 0.5,
+):
     """Blend each image with another from the same batch. Returns (x, y_a, y_b, lam).
 
     mixup:  a weighted pixel average of two images; the target becomes the same weighted mix.
@@ -184,18 +296,20 @@ def mixup_cutmix(x: torch.Tensor, y: torch.Tensor, mixup_alpha: float = 0.2,
     b = x.size(0)
     perm = torch.randperm(b, device=x.device)
 
-    if torch.rand(()) < prob:                                  # ---- mixup
+    if torch.rand(()) < prob:  # ---- mixup
         lam = float(torch.distributions.Beta(mixup_alpha, mixup_alpha).sample())
         x = lam * x + (1 - lam) * x[perm]
-    else:                                                       # ---- CutMix
+    else:  # ---- CutMix
         lam = float(torch.distributions.Beta(cutmix_alpha, cutmix_alpha).sample())
         h, w = x.shape[2:]
         rh, rw = int(h * (1 - lam) ** 0.5), int(w * (1 - lam) ** 0.5)
         if rh > 0 and rw > 0:
             cy = int(torch.randint(0, h - rh + 1, ()))
             cx = int(torch.randint(0, w - rw + 1, ()))
-            x[:, :, cy:cy + rh, cx:cx + rw] = x[perm][:, :, cy:cy + rh, cx:cx + rw]
-            lam = 1 - (rh * rw) / (h * w)                       # true mixed area, not the sampled lam
+            x[:, :, cy : cy + rh, cx : cx + rw] = x[perm][
+                :, :, cy : cy + rh, cx : cx + rw
+            ]
+            lam = 1 - (rh * rw) / (h * w)  # true mixed area, not the sampled lam
         else:
             lam = 1.0
     return x, y, y[perm], lam
